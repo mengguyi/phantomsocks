@@ -5,8 +5,8 @@ package phantomtcp
 
 var HintMap = map[string]uint32{
 	"none":  HINT_NONE,
-	"http":  HINT_HTTP,
 	"https": HINT_HTTPS,
+	"h2":    HINT_HTTP2,
 	"h3":    HINT_HTTP3,
 
 	"ipv4": HINT_IPV4,
@@ -16,10 +16,13 @@ var HintMap = map[string]uint32{
 	"strip":    HINT_STRIP,
 	"fronting": HINT_FRONTING,
 
-	"mss":    HINT_MSS,
 	"udp":    HINT_UDP,
 	"no-tcp": HINT_NOTCP,
 	"delay":  HINT_DELAY,
+
+	"s-seg":    HINT_SSEG,
+	"1-seg":    HINT_1SEG,
+	"tls-frag": HINT_TLSFRAG,
 }
 
 func DevicePrint() {

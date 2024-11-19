@@ -19,8 +19,8 @@ import (
 var HintMap = map[string]uint32{
 	"none": HINT_NONE,
 
-	"http":  HINT_HTTP,
 	"https": HINT_HTTPS,
+	"h2":    HINT_HTTP2,
 	"h3":    HINT_HTTP3,
 
 	"ipv4": HINT_IPV4,
@@ -31,7 +31,6 @@ var HintMap = map[string]uint32{
 	"fronting": HINT_FRONTING,
 
 	"ttl":    HINT_TTL,
-	"mss":    HINT_MSS,
 	"w-md5":  HINT_WMD5,
 	"n-ack":  HINT_NACK,
 	"w-ack":  HINT_WACK,
@@ -50,6 +49,7 @@ var HintMap = map[string]uint32{
 	"rand":       HINT_RAND,
 	"s-seg":      HINT_SSEG,
 	"1-seg":      HINT_1SEG,
+	"tls-frag":   HINT_TLSFRAG,
 	"half-tfo":   HINT_HTFO,
 	"keep-alive": HINT_KEEPALIVE,
 	"synx2":      HINT_SYNX2,
@@ -555,9 +555,9 @@ func RedirectDNS() {
 			continue
 		}
 
-		server := DefaultProfile.GetInterface(qname)
-		if server != nil {
-			logPrintln(1, qname, server)
+		pface, _ := DefaultProfile.GetInterface(qname)
+		if pface != nil {
+			logPrintln(1, qname, pface)
 			_, response := NSRequest(request, true)
 			udpsize := len(response) + 8
 

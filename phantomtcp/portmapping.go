@@ -118,6 +118,26 @@ func DialUDP(address string) (net.Conn, error) {
 	}
 }
 
+func DialTCP(address string, device string) (net.Conn, error) {
+	if device == "" {
+		return net.Dial("tcp", address)
+	} else {
+		str_laddr, err := GetAddressFromInterface(device, IsIPv6(address))
+		if err != nil {
+			return nil, err
+		}
+		laddr, err := net.ResolveTCPAddr("tcp", str_laddr+":0")
+		if err != nil {
+			return nil, err
+		}
+		raddr, err := net.ResolveTCPAddr("tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		return net.DialTCP("tcp", laddr, raddr)
+	}
+}
+
 func UDPMapping(Address string, Target string) error {
 	if len(Target) == 0 {
 		return nil

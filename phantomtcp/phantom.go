@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -78,7 +79,7 @@ type PhantomInterface struct {
 
 	Protocol      byte
 	Address       string
-	Authorization []byte
+	Authorization string
 
 	Timeout  uint16
 	Fallback *PhantomInterface
@@ -114,8 +115,8 @@ const (
 	HINT_NONE = 0x0
 
 	HINT_ALPN  = 0x1 << 1
-	HINT_HTTP  = 0x1 << 2
-	HINT_HTTPS = 0x1 << 3
+	HINT_HTTPS = 0x1 << 2
+	HINT_HTTP2 = 0x1 << 3
 	HINT_HTTP3 = 0x1 << 4
 
 	HINT_IPV4 = 0x1 << 5
@@ -126,34 +127,34 @@ const (
 	HINT_FRONTING = 0x1 << 9
 
 	HINT_TTL   = 0x1 << 10
-	HINT_MSS   = 0x1 << 11
-	HINT_WMD5  = 0x1 << 12
-	HINT_NACK  = 0x1 << 13
-	HINT_WACK  = 0x1 << 14
-	HINT_WCSUM = 0x1 << 15
-	HINT_WSEQ  = 0x1 << 16
-	HINT_WTIME = 0x1 << 17
+	HINT_WMD5  = 0x1 << 11
+	HINT_NACK  = 0x1 << 12
+	HINT_WACK  = 0x1 << 13
+	HINT_WCSUM = 0x1 << 14
+	HINT_WSEQ  = 0x1 << 15
+	HINT_WTIME = 0x1 << 16
 
-	HINT_TFO   = 0x1 << 18
-	HINT_UDP   = 0x1 << 19
-	HINT_NOTCP = 0x1 << 20
-	HINT_DELAY = 0x1 << 21
+	HINT_TFO   = 0x1 << 17
+	HINT_UDP   = 0x1 << 18
+	HINT_NOTCP = 0x1 << 19
+	HINT_DELAY = 0x1 << 20
 
-	HINT_MODE2     = 0x1 << 22
-	HINT_DF        = 0x1 << 23
-	HINT_SAT       = 0x1 << 24
-	HINT_RAND      = 0x1 << 25
-	HINT_SSEG      = 0x1 << 26
-	HINT_1SEG      = 0x1 << 27
+	HINT_MODE2     = 0x1 << 21
+	HINT_DF        = 0x1 << 22
+	HINT_SAT       = 0x1 << 23
+	HINT_RAND      = 0x1 << 24
+	HINT_SSEG      = 0x1 << 25
+	HINT_1SEG      = 0x1 << 26
+	HINT_TLSFRAG   = 0x1 << 27
 	HINT_HTFO      = 0x1 << 28
 	HINT_KEEPALIVE = 0x1 << 29
 	HINT_SYNX2     = 0x1 << 30
 	HINT_ZERO      = 0x1 << 31
 )
 
-const HINT_DNS = HINT_ALPN | HINT_HTTP | HINT_HTTPS | HINT_HTTP3 | HINT_IPV4 | HINT_IPV6
+const HINT_DNS = HINT_ALPN | HINT_HTTPS | HINT_HTTP2 | HINT_HTTP3 | HINT_IPV4 | HINT_IPV6
 const HINT_FAKE = HINT_TTL | HINT_WMD5 | HINT_NACK | HINT_WACK | HINT_WCSUM | HINT_WSEQ | HINT_WTIME
-const HINT_MODIFY = HINT_FAKE | HINT_SSEG | HINT_TFO | HINT_HTFO | HINT_MODE2 | HINT_MOVE | HINT_STRIP | HINT_FRONTING
+const HINT_MODIFY = HINT_FAKE | HINT_SSEG | HINT_1SEG | HINT_TLSFRAG | HINT_TFO | HINT_HTFO | HINT_MODE2 | HINT_MOVE | HINT_STRIP | HINT_FRONTING
 
 var Logger *log.Logger
 
@@ -163,10 +164,10 @@ func logPrintln(level int, v ...interface{}) {
 	}
 }
 
-func (profile *PhantomProfile) GetInterface(name string) *PhantomInterface {
+func (profile *PhantomProfile) GetInterface(name string) (*PhantomInterface, int) {
 	config, ok := profile.DomainMap[name]
 	if ok {
-		return config
+		return config, 0
 	}
 
 	offset := 0
@@ -178,12 +179,12 @@ func (profile *PhantomProfile) GetInterface(name string) *PhantomInterface {
 		offset += off
 		config, ok = profile.DomainMap[name[offset:]]
 		if ok {
-			return config
+			return config, offset
 		}
 		offset++
 	}
 
-	return DefaultInterface
+	return DefaultInterface, 0
 }
 
 func (profile *PhantomProfile) GetInterfaceByIP(ip net.IP) *PhantomInterface {
@@ -318,6 +319,25 @@ func GetSNI(header []byte) (offset int, length int, ech bool) {
 		offset += int(ExtensionLength)
 	}
 	return 0, 0, ech
+}
+
+func TLSFragment(header []byte, frag_size int) []byte {
+	headr_len := len(header)
+	first_frag_offset := frag_size / 2
+	fragmented_header := make([]byte, headr_len+10)
+
+	copy(fragmented_header, header[:3])
+	binary.BigEndian.PutUint16(fragmented_header[3:], uint16(first_frag_offset-5))
+	copy(fragmented_header[5:], header[5:first_frag_offset])
+
+	copy(fragmented_header[first_frag_offset:], header[:3])
+	binary.BigEndian.PutUint16(fragmented_header[first_frag_offset+3:], uint16(frag_size-first_frag_offset))
+	copy(fragmented_header[first_frag_offset+5:], header[first_frag_offset:frag_size])
+
+	copy(fragmented_header[frag_size+5:], header[:3])
+	binary.BigEndian.PutUint16(fragmented_header[frag_size+8:], uint16(headr_len-frag_size))
+	copy(fragmented_header[frag_size+10:], header[frag_size:])
+	return fragmented_header
 }
 
 func GetQUICSNI(b []byte) string {
@@ -499,7 +519,7 @@ func LoadProfile(filename string) error {
 
 	br := bufio.NewReader(conf)
 
-	var CurrentInterface *PhantomInterface = &PhantomInterface{}
+	var CurrentInterface *PhantomInterface = DefaultInterface
 
 	for {
 		line, _, err := br.ReadLine()
@@ -532,10 +552,9 @@ func LoadProfile(filename string) error {
 					} else {
 						if strings.HasPrefix(keys[1], "[") {
 							quote := keys[1][1 : len(keys[1])-1]
-							result, hasCache := DNSCache.Load(quote)
+							records, hasCache := DNSCache[quote]
 							if hasCache {
-								records := result.(*DNSRecords)
-								DNSCache.Store(keys[0], records)
+								DNSCache[keys[0]] = records
 							}
 							s, ok := DefaultProfile.DomainMap[quote]
 							if ok {
@@ -546,29 +565,27 @@ func LoadProfile(filename string) error {
 							ip := net.ParseIP(keys[0])
 							records := new(DNSRecords)
 							if CurrentInterface.Hint&HINT_MODIFY != 0 || CurrentInterface.Protocol != 0 {
-								records.Index = uint32(len(Nose))
+								records.Index = AddDNSLie(keys[0], CurrentInterface)
 								records.ALPN = CurrentInterface.Hint & HINT_DNS
-								Nose = append(Nose, keys[0])
 							}
 
 							addrs := strings.Split(keys[1], ",")
 							for i := 0; i < len(addrs); i++ {
 								ip := net.ParseIP(addrs[i])
 								if ip == nil {
-									result, hasCache := DNSCache.Load(addrs[i])
+									result, hasCache := DNSCache[addrs[i]]
 									if hasCache {
-										r := result.(*DNSRecords)
-										if r.IPv4Hint != nil {
+										if records.IPv4Hint != nil {
 											if records.IPv4Hint == nil {
 												records.IPv4Hint = new(RecordAddresses)
 											}
-											records.IPv4Hint.Addresses = append(records.IPv4Hint.Addresses, r.IPv4Hint.Addresses...)
+											records.IPv4Hint.Addresses = append(records.IPv4Hint.Addresses, result.IPv4Hint.Addresses...)
 										}
-										if r.IPv6Hint != nil {
+										if result.IPv6Hint != nil {
 											if records.IPv6Hint == nil {
 												records.IPv6Hint = new(RecordAddresses)
 											}
-											records.IPv6Hint.Addresses = append(records.IPv6Hint.Addresses, r.IPv6Hint.Addresses...)
+											records.IPv6Hint.Addresses = append(records.IPv6Hint.Addresses, result.IPv6Hint.Addresses...)
 										}
 									} else {
 										log.Println(keys[0], addrs[i], "bad address")
@@ -591,10 +608,10 @@ func LoadProfile(filename string) error {
 
 							if ip == nil {
 								DefaultProfile.DomainMap[keys[0]] = CurrentInterface
-								DNSCache.Store(keys[0], records)
+								DNSCache[keys[0]] = records
 							} else {
 								DefaultProfile.DomainMap[ip.String()] = CurrentInterface
-								DNSCache.Store(ip.String(), records)
+								DNSCache[ip.String()] = records
 							}
 						}
 					}
@@ -638,7 +655,7 @@ func LoadProfile(filename string) error {
 									if CurrentInterface.DNS != "" || CurrentInterface.Protocol != 0 {
 										DefaultProfile.DomainMap[keys[0]] = CurrentInterface
 										records := new(DNSRecords)
-										DNSCache.Store(keys[0], records)
+										DNSCache[keys[0]] = records
 									} else {
 										DefaultProfile.DomainMap[keys[0]] = nil
 									}
@@ -691,7 +708,7 @@ func LoadHosts(filename string) error {
 			var records *DNSRecords
 
 			name := k[1]
-			_, ok := DNSCache.Load(name)
+			_, ok := DNSCache[name]
 			if ok {
 				continue
 			}
@@ -702,21 +719,20 @@ func LoadHosts(filename string) error {
 					break
 				}
 				offset += off
-				result, ok := DNSCache.Load(name[offset:])
+				result, ok := DNSCache[name[offset:]]
 				if ok {
 					records = new(DNSRecords)
-					*records = *result.(*DNSRecords)
-					DNSCache.Store(name, records)
+					*records = *result
+					DNSCache[name] = records
 					continue
 				}
 				offset++
 			}
 
-			server := DefaultProfile.GetInterface(name)
-			if ok && server.Hint != 0 {
-				records.Index = uint32(len(Nose))
-				records.ALPN = server.Hint & HINT_DNS
-				Nose = append(Nose, name)
+			pface, _ := DefaultProfile.GetInterface(name)
+			if ok && pface.Hint != 0 {
+				records.Index = AddDNSLie(name, pface)
+				records.ALPN = pface.Hint & HINT_DNS
 			}
 			ip := net.ParseIP(k[0])
 			if ip == nil {
@@ -827,10 +843,12 @@ func CreateInterfaces(Interfaces []InterfaceConfig) []string {
 			pface.Protocol = NAT64
 		case "http":
 			pface.Protocol = HTTP
-			pface.Authorization = []byte(fmt.Sprintf("%s:%s\r\n", config.PublicKey, config.PrivateKey))
+			Authorization := []byte(fmt.Sprintf("%s:%s", config.PublicKey, config.PrivateKey))
+			pface.Authorization = fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString(Authorization))
 		case "https":
 			pface.Protocol = HTTPS
-			pface.Authorization = []byte(fmt.Sprintf("%s:%s\r\n", config.PublicKey, config.PrivateKey))
+			Authorization := []byte(fmt.Sprintf("%s:%s", config.PublicKey, config.PrivateKey))
+			pface.Authorization = fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString(Authorization))
 		case "socks4":
 			pface.Protocol = SOCKS4
 		case "socks5":

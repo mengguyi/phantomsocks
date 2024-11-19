@@ -2,17 +2,12 @@ package phantomtcp
 
 import (
 	"crypto/rand"
-	"crypto/tls"
-	"encoding/base64"
-	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	mathrand "math/rand"
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -125,7 +120,7 @@ func GetLocalAddr(name string, ipv6 bool) (*net.TCPAddr, error) {
 			var laddr *net.TCPAddr
 			ip4 := localAddr.IP.To4()
 			if ipv6 {
-				if ip4 != nil || localAddr.IP[0]&0xfc == 0xfc {
+				if ip4 != nil || localAddr.IP.IsPrivate() {
 					continue
 				}
 				ip := make([]byte, 16)
@@ -147,40 +142,37 @@ func GetLocalAddr(name string, ipv6 bool) (*net.TCPAddr, error) {
 	return nil, nil
 }
 
-func (pface *PhantomInterface) Dial(host string, port int, b []byte) (net.Conn, *ConnectionInfo, error) {
+func (pface *PhantomInterface) Dial(conn net.Conn, host string, port int, b []byte) (net.Conn, *ConnectionInfo, error) {
 	connect_err := errors.New("connection does not exist")
 	raddrs, err := pface.GetRemoteAddresses(host, port)
-	if err != nil || raddrs == nil {
+	if err != nil {
 		return nil, nil, err
 	}
 
-	var conn net.Conn
 	device := pface.Device
 	hint := pface.Hint
 
-	if hint&HINT_MODIFY == 0 {
-		raddr := raddrs[mathrand.Intn(len(raddrs))]
-		var laddr *net.TCPAddr = nil
-		if device != "" {
-			laddr, err = GetLocalAddr(device, raddr.IP.To4() == nil)
-			if err != nil {
-				return nil, nil, err
-			}
-		}
-
-		conn, err = net.DialTCP("tcp", laddr, raddr)
-		if err == nil {
-			if pface.Protocol != 0 {
-				err = pface.ProxyHandshake(conn, nil, host, port)
+	if hint&HINT_FAKE == 0 {
+		if conn == nil {
+			raddr := raddrs[mathrand.Intn(len(raddrs))]
+			var laddr *net.TCPAddr = nil
+			if device != "" {
+				laddr, err = GetLocalAddr(device, raddr.IP.To4() == nil)
 				if err != nil {
-					conn.Close()
 					return nil, nil, err
 				}
 			}
 
-			if b != nil {
-				_, err = conn.Write(b)
+			conn, err = net.DialTCP("tcp", laddr, raddr)
+		}
+
+		if err == nil {
+			proxyConn, err := pface.ProxyHandshake(conn, nil, host, port, b)
+			if err != nil {
+				conn.Close()
+				return nil, nil, err
 			}
+			conn = proxyConn
 		}
 
 		return conn, nil, err
@@ -232,8 +224,8 @@ func (pface *PhantomInterface) Dial(host string, port int, b []byte) (net.Conn, 
 			}
 
 			conn, err = net.DialTCP("tcp", laddr, raddr)
-			if err == nil && pface.Protocol != 0 {
-				err = pface.ProxyHandshake(conn, nil, host, port)
+			if err == nil {
+				conn, err = pface.ProxyHandshake(conn, nil, host, port, nil)
 			}
 
 			if err == nil && b != nil {
@@ -258,6 +250,8 @@ func (pface *PhantomInterface) Dial(host string, port int, b []byte) (net.Conn, 
 
 			return conn, nil, err
 		} else {
+			start_time := time.Now()
+
 			if offset == 0 {
 				length = len(b)
 				hint |= HINT_RAND
@@ -328,7 +322,7 @@ func (pface *PhantomInterface) Dial(host string, port int, b []byte) (net.Conn, 
 				return nil, nil, connect_err
 			}
 
-			logPrintln(3, host, conn.RemoteAddr(), "connected")
+			logPrintln(3, host, conn.RemoteAddr(), "connected", time.Since(start_time))
 
 			if (hint & HINT_DELAY) != 0 {
 				time.Sleep(time.Second)
@@ -337,7 +331,7 @@ func (pface *PhantomInterface) Dial(host string, port int, b []byte) (net.Conn, 
 			synpacket.TCP.Seq++
 
 			if pface.Protocol != 0 {
-				err = pface.ProxyHandshake(conn, synpacket, host, port)
+				conn, err = pface.ProxyHandshake(conn, synpacket, host, port, nil)
 				if err != nil {
 					conn.Close()
 					return nil, nil, err
@@ -448,15 +442,15 @@ func (server *PhantomInterface) Keep(client, conn net.Conn, connInfo *Connection
 	io.Copy(client, conn)
 }
 
-func (server *PhantomInterface) GetRemoteAddresses(host string, port int) ([]*net.TCPAddr, error) {
-	switch server.Protocol {
+func (pface *PhantomInterface) GetRemoteAddresses(host string, port int) ([]*net.TCPAddr, error) {
+	switch pface.Protocol {
 	case DIRECT:
-		return server.ResolveTCPAddrs(host, port)
+		return pface.ResolveTCPAddrs(host, port)
 	case REDIRECT:
-		if server.Address != "" {
+		if pface.Address != "" {
 			var str_port string
 			var err error
-			host, str_port, err = net.SplitHostPort(server.Address)
+			host, str_port, err = net.SplitHostPort(pface.Address)
 			if err != nil {
 				return nil, err
 			}
@@ -465,20 +459,20 @@ func (server *PhantomInterface) GetRemoteAddresses(host string, port int) ([]*ne
 				return nil, err
 			}
 		}
-		return server.ResolveTCPAddrs(host, port)
+		return pface.ResolveTCPAddrs(host, port)
 	case NAT64:
-		addrs, err := server.ResolveTCPAddrs(host, port)
+		addrs, err := pface.ResolveTCPAddrs(host, port)
 		if err != nil {
 			return nil, err
 		}
 		tcpAddrs := make([]*net.TCPAddr, len(addrs))
 		for i, addr := range addrs {
-			proxy := server.Address + addr.IP.String()
+			proxy := pface.Address + addr.IP.String()
 			tcpAddrs[i] = &net.TCPAddr{IP: net.ParseIP(proxy), Port: port}
 		}
 		return tcpAddrs, nil
 	default:
-		host, str_port, err := net.SplitHostPort(server.Address)
+		host, str_port, err := net.SplitHostPort(pface.Address)
 		if err != nil {
 			return nil, err
 		}
@@ -486,215 +480,9 @@ func (server *PhantomInterface) GetRemoteAddresses(host string, port int) ([]*ne
 		if err != nil {
 			return nil, err
 		}
-		return server.ResolveTCPAddrs(host, port)
+		pface, _ := DefaultProfile.GetInterface(host)
+		return pface.ResolveTCPAddrs(host, port)
 	}
-}
-
-func (pface *PhantomInterface) ProxyHandshake(conn net.Conn, synpacket *ConnectionInfo, host string, port int) error {
-	var err error
-	proxy_err := errors.New("invalid proxy")
-
-	hint := pface.Hint & HINT_MODIFY
-	var proxy_seq uint32 = 0
-	switch pface.Protocol {
-	case REDIRECT:
-	case NAT64:
-	case HTTP:
-		{
-			header := fmt.Sprintf("CONNECT %s HTTP/1.1\r\n", net.JoinHostPort(host, strconv.Itoa(port)))
-			if pface.Authorization != nil {
-				header += fmt.Sprintf("Authorization: Basic %s\r\n", base64.RawURLEncoding.EncodeToString(pface.Authorization))
-			}
-			header += "\r\n"
-			request := []byte(header)
-			fakepayload := make([]byte, len(request))
-			var n int = 0
-			if synpacket != nil {
-				if hint&HINT_SSEG != 0 {
-					n, err = conn.Write(request[:4])
-					if err != nil {
-						return err
-					}
-				} else if hint&HINT_MODE2 != 0 {
-					n, err = conn.Write(request[:10])
-					if err != nil {
-						return err
-					}
-				}
-
-				proxy_seq += uint32(n)
-				err = ModifyAndSendPacket(synpacket, fakepayload, hint, pface.TTL, 2)
-				if err != nil {
-					return err
-				}
-
-				if hint&HINT_SSEG != 0 {
-					n, err = conn.Write(request[4:])
-				} else if hint&HINT_MODE2 != 0 {
-					n, err = conn.Write(request[10:])
-				} else {
-					n, err = conn.Write(request)
-				}
-				if err != nil {
-					return err
-				}
-				proxy_seq += uint32(n)
-			} else {
-				n, err = conn.Write(request)
-				if err != nil || n == 0 {
-					return err
-				}
-			}
-			var response [128]byte
-			n, err = conn.Read(response[:])
-			if err != nil || !strings.HasPrefix(string(response[:n]), "HTTP/1.1 200 ") {
-				return errors.New("failed to connect to proxy")
-			}
-		}
-	case HTTPS:
-		{
-			var b [264]byte
-			if synpacket != nil {
-				err := ModifyAndSendPacket(synpacket, b[:], hint, pface.TTL, 2)
-				if err != nil {
-					return err
-				}
-			}
-			conf := &tls.Config{
-				InsecureSkipVerify: true,
-			}
-			conn = tls.Client(conn, conf)
-			header := fmt.Sprintf("CONNECT %s HTTP/1.1\r\n", net.JoinHostPort(host, strconv.Itoa(port)))
-			if pface.Authorization != nil {
-				header += fmt.Sprintf("Authorization: Basic %s\r\n", base64.RawURLEncoding.EncodeToString(pface.Authorization))
-			}
-			header += "\r\n"
-			request := []byte(header)
-			n, err := conn.Write(request)
-			if err != nil || n == 0 {
-				return err
-			}
-			var response [128]byte
-			n, err = conn.Read(response[:])
-			if err != nil || !strings.HasPrefix(string(response[:n]), "HTTP/1.1 200 ") {
-				return errors.New("failed to connect to proxy")
-			}
-		}
-	case SOCKS4:
-		{
-			var b [264]byte
-			if synpacket != nil {
-				err := ModifyAndSendPacket(synpacket, b[:], hint, pface.TTL, 2)
-				if err != nil {
-					return err
-				}
-			}
-
-			copy(b[:], []byte{0x04, 0x01})
-			binary.BigEndian.PutUint16(b[2:], uint16(port))
-
-			requestLen := 0
-			ip := net.ParseIP(host).To4()
-			if ip != nil {
-				copy(b[4:], ip[:4])
-				b[8] = 0
-				requestLen = 9
-			} else {
-				copy(b[4:], []byte{0, 0, 0, 1, 0})
-				copy(b[9:], []byte(host))
-				requestLen = 9 + len(host)
-				b[requestLen] = 0
-				requestLen++
-			}
-			n, err := conn.Write(b[:requestLen])
-			if err != nil {
-				return err
-			}
-			proxy_seq += uint32(n)
-			n, err = conn.Read(b[:8])
-			if err != nil {
-				return err
-			}
-			if n < 8 || b[0] != 0 || b[1] != 90 {
-				return proxy_err
-			}
-		}
-	case SOCKS5:
-		{
-			var b [264]byte
-			if synpacket != nil {
-				err := ModifyAndSendPacket(synpacket, b[:], hint, pface.TTL, 2)
-				if err != nil {
-					return err
-				}
-			}
-
-			n, err := conn.Write([]byte{0x05, 0x01, 0x00})
-			if err != nil {
-				return err
-			}
-			proxy_seq += uint32(n)
-			_, err = conn.Read(b[:])
-			if err != nil {
-				return err
-			}
-
-			if b[0] != 0x05 {
-				return proxy_err
-			}
-
-			if pface.DNS != "" {
-				_, ips := NSLookup(host, pface.Hint, pface.DNS)
-				if ips != nil {
-					ip := ips[mathrand.Intn(len(ips))]
-					ip4 := ip.To4()
-					if ip4 != nil {
-						copy(b[:], []byte{0x05, 0x01, 0x00, 0x01})
-						copy(b[4:], ip4[:4])
-						binary.BigEndian.PutUint16(b[8:], uint16(port))
-						n, err = conn.Write(b[:10])
-					} else {
-						copy(b[:], []byte{0x05, 0x01, 0x00, 0x04})
-						copy(b[4:], ip[:16])
-						binary.BigEndian.PutUint16(b[20:], uint16(port))
-						n, err = conn.Write(b[:22])
-					}
-					host = ""
-				}
-			}
-
-			if host != "" {
-				copy(b[:], []byte{0x05, 0x01, 0x00, 0x03})
-				hostLen := len(host)
-				b[4] = byte(hostLen)
-				copy(b[5:], []byte(host))
-				binary.BigEndian.PutUint16(b[5+hostLen:], uint16(port))
-				n, err = conn.Write(b[:7+hostLen])
-			}
-
-			if err != nil {
-				return err
-			}
-
-			proxy_seq += uint32(n)
-
-			n, err = conn.Read(b[:])
-			if err != nil {
-				return err
-			}
-			if n < 2 || b[0] != 0x05 || b[1] != 0x00 {
-				return proxy_err
-			}
-		}
-	default:
-		return proxy_err
-	}
-
-	if synpacket != nil {
-		synpacket.TCP.Seq += proxy_seq
-	}
-
-	return nil
 }
 
 func relay(left, right net.Conn) (int64, int64, error) {
@@ -706,14 +494,14 @@ func relay(left, right net.Conn) (int64, int64, error) {
 
 	go func() {
 		n, err := io.Copy(right, left)
-		right.SetDeadline(time.Now()) // wake up the other goroutine blocking on right
-		left.SetDeadline(time.Now())  // wake up the other goroutine blocking on left
+		right.SetDeadline(time.Now())
+		left.SetDeadline(time.Now())
 		ch <- res{n, err}
 	}()
 
 	n, err := io.Copy(left, right)
-	right.SetDeadline(time.Now()) // wake up the other goroutine blocking on right
-	left.SetDeadline(time.Now())  // wake up the other goroutine blocking on left
+	right.SetDeadline(time.Now())
+	left.SetDeadline(time.Now())
 	rs := <-ch
 
 	if err == nil {

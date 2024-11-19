@@ -25,11 +25,11 @@ func DialConnInfo(laddr, raddr *net.TCPAddr, pface *PhantomInterface, payload []
 
 	AddConn(addr, pface.Hint)
 
-	if (pface.Hint & (HINT_MSS | HINT_TFO | HINT_HTFO | HINT_KEEPALIVE)) != 0 {
+	if (pface.Hint&(HINT_TFO|HINT_HTFO|HINT_KEEPALIVE)) != 0 || (pface.MTU) > 0 {
 		d := net.Dialer{Timeout: timeout, LocalAddr: laddr,
 			Control: func(network, address string, c syscall.RawConn) error {
 				err := c.Control(func(fd uintptr) {
-					if (pface.Hint & HINT_MSS) != 0 {
+					if (pface.MTU) > 0 {
 						syscall.SetsockoptInt(int(fd),
 							syscall.SOL_TCP, syscall.TCP_MAXSEG, int(pface.MTU))
 					}

@@ -30,6 +30,7 @@ func TProxyUDP(address string) {
 		}
 
 		var host string
+		var pface *PhantomInterface
 		dstIP4 := dstAddr.IP.To4()
 		if dstIP4 != nil {
 			if dstIP4[0] == VirtualAddrPrefix {
@@ -38,7 +39,7 @@ func TProxyUDP(address string) {
 					logPrintln(4, "TProxy(UDP):", srcAddr, "->", dstAddr, "out of range")
 					continue
 				}
-				host = Nose[index]
+				host, pface = GetDNSLie(index)
 			} else {
 				continue
 			}
@@ -48,12 +49,11 @@ func TProxyUDP(address string) {
 				logPrintln(4, "TProxy(UDP):", srcAddr, "->", dstAddr, "out of range")
 				continue
 			}
-			host = Nose[index]
+			host, pface = GetDNSLie(index)
 		} else {
 			continue
 		}
 
-		pface := DefaultProfile.GetInterface(host)
 		if pface.Hint&HINT_UDP == 0 {
 			if pface.Hint&(HINT_HTTP3) == 0 {
 				logPrintln(4, "TProxy(UDP):", srcAddr, "->", host, "not allow")
