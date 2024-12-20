@@ -11,11 +11,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+var DNSCacheMutex sync.RWMutex
+var DNSRecordMutex sync.RWMutex
 
 type RecordAddresses struct {
 	TTL       int64
@@ -27,13 +31,19 @@ type DNSRecords struct {
 	ALPN     uint32
 	IPv4Hint *RecordAddresses
 	IPv6Hint *RecordAddresses
+	CName    string
 	Ech      []byte
+}
+
+type DNSLie struct {
+	Name      string
+	Interface *PhantomInterface
 }
 
 var DNSMinTTL uint32 = 0
 var VirtualAddrPrefix byte = 255
-var DNSCache sync.Map
-var Nose []string = []string{"phantom.socks"}
+var DNSCache map[string]*DNSRecords = make(map[string]*DNSRecords)
+var Nose []DNSLie = []DNSLie{{"phantom.socks", nil}}
 var NoseLock sync.Mutex
 
 func TCPlookup(request []byte, address string, server *PhantomInterface) ([]byte, error) {
@@ -45,7 +55,7 @@ func TCPlookup(request []byte, address string, server *PhantomInterface) ([]byte
 	var err error = nil
 	if server != nil {
 		host, port := splitHostPort(address)
-		conn, _, err = server.Dial(host, port, data[:len(request)+2])
+		conn, _, err = server.Dial(nil, host, port, data[:len(request)+2])
 		if err != nil {
 			return nil, err
 		}
@@ -438,6 +448,9 @@ func GetNameOffset(response []byte, offset int) int {
 }
 
 func (records *DNSRecords) GetAnswers(response []byte, options ServerOptions) {
+	DNSRecordMutex.Lock()
+	defer DNSRecordMutex.Unlock()
+
 	nsfilter := func(address net.IP) net.IP {
 		if options.BadSubnet != nil {
 			if options.BadSubnet.Contains(address) {
@@ -558,9 +571,9 @@ func (records *DNSRecords) GetAnswers(response []byte, options ServerOptions) {
 						offset += ALPNLen
 						switch ALPN {
 						case "http/1.1":
-							records.ALPN |= HINT_HTTP
-						case "h2":
 							records.ALPN |= HINT_HTTPS
+						case "h2":
+							records.ALPN |= HINT_HTTP2
 						case "h3":
 							records.ALPN |= HINT_HTTP3
 						}
@@ -597,6 +610,9 @@ func (records *DNSRecords) GetAnswers(response []byte, options ServerOptions) {
 }
 
 func (records *DNSRecords) PackAnswers(qtype int, minttl uint32) (int, []byte) {
+	DNSRecordMutex.RLock()
+	defer DNSRecordMutex.RUnlock()
+
 	packA := func(rec *RecordAddresses) (int, []byte) {
 		var ttl uint32 = 0
 		if rec.TTL > 0 {
@@ -608,7 +624,8 @@ func (records *DNSRecords) PackAnswers(qtype int, minttl uint32) (int, []byte) {
 
 		count := 0
 		totalLen := 0
-		for _, ip := range rec.Addresses {
+		addresses := rec.Addresses
+		for _, ip := range addresses {
 			ip4 := ip.To4()
 			if ip4 != nil {
 				count++
@@ -621,7 +638,8 @@ func (records *DNSRecords) PackAnswers(qtype int, minttl uint32) (int, []byte) {
 
 		answers := make([]byte, totalLen)
 		length := 0
-		for _, ip := range rec.Addresses {
+		for i := 0; i < count; i++ {
+			ip := addresses[i]
 			ip4 := ip.To4()
 			if ip4 != nil {
 				copy(answers[length:], []byte{0xC0, 0x0C, 0x00, 1,
@@ -763,14 +781,18 @@ func (records *DNSRecords) PackAnswers(qtype int, minttl uint32) (int, []byte) {
 	return 0, nil
 }
 
-func (records DNSRecords) BuildResponse(request []byte, qtype int, minttl uint32) []byte {
-	response := make([]byte, 1024)
-	copy(response, request)
+func (records *DNSRecords) BuildResponse(request []byte, qtype int, minttl uint32) []byte {
+	DNSRecordMutex.RLock()
+	defer DNSRecordMutex.RUnlock()
+
 	length := len(request)
-	response[2] = 0x81
-	response[3] = 0x80
 
 	if records.Index > 0 {
+		response := make([]byte, 512)
+		copy(response, request)
+		response[2] = 0x81
+		response[3] = 0x80
+
 		switch qtype {
 		case 1:
 			answer := []byte{0xC0, 0x0C, 0x00, 1,
@@ -821,16 +843,40 @@ func (records DNSRecords) BuildResponse(request []byte, qtype int, minttl uint32
 			binary.BigEndian.PutUint16(response[6:], 1)
 			binary.BigEndian.PutUint16(response[dataLenOffset:], uint16(length-dataLenOffset-2))
 		}
+
+		return response[:length]
 	} else {
+		if records.IPv4Hint == nil && records.IPv6Hint == nil {
+			response := make([]byte, length+75)
+			copy(response, request)
+			response[2] = 0x81
+			response[3] = 0xa3
+			binary.BigEndian.PutUint16(response[6:], 1)
+			copy(response[length:], []byte{
+				0x00, 0x00, 0x06, 0x00, 0x01, 0x00, 0x01, 0x51, 0x6e, 0x00, 0x40, 0x01, 0x61, 0x0c, 0x72, 0x6f,
+				0x6f, 0x74, 0x2d, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x73, 0x03, 0x6e, 0x65, 0x74, 0x00, 0x05,
+				0x6e, 0x73, 0x74, 0x6c, 0x64, 0x0c, 0x76, 0x65, 0x72, 0x69, 0x73, 0x69, 0x67, 0x6e, 0x2d, 0x67,
+				0x72, 0x73, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x78, 0xa4, 0x92, 0x64, 0x00, 0x00, 0x07, 0x08, 0x00,
+				0x00, 0x03, 0x84, 0x00, 0x09, 0x3a, 0x80, 0x00, 0x01, 0x51, 0x80})
+			length += 75
+
+			return response[:length]
+		}
+
 		count, answer := records.PackAnswers(qtype, minttl)
+		response := make([]byte, length+len(answer))
+		copy(response, request)
+		response[2] = 0x81
+		response[3] = 0x80
+
 		if count > 0 {
 			binary.BigEndian.PutUint16(response[6:], uint16(count))
 			copy(response[length:], answer)
 			length += len(answer)
 		}
-	}
 
-	return response[:length]
+		return response[:length]
+	}
 }
 
 func PackQName(name string) []byte {
@@ -857,6 +903,7 @@ type ServerOptions struct {
 	Type      string
 	PD        string
 	Domain    string
+	Output    string
 	BadSubnet *net.IPNet
 	Fallback  net.IP
 }
@@ -876,6 +923,8 @@ func ParseOptions(options string) ServerOptions {
 				serverOpts.Type = key[1]
 			case "domain":
 				serverOpts.Domain = key[1]
+			case "output":
+				serverOpts.Output = key[1]
 			case "badsubnet":
 				_, serverOpts.BadSubnet, _ = net.ParseCIDR(key[1])
 			case "fallback":
@@ -963,21 +1012,41 @@ func PackRequest(name string, qtype uint16, id uint16, ecs string) []byte {
 }
 
 func LoadDNSCache(qname string) *DNSRecords {
-	var ok bool
-	var result interface{}
-	result, ok = DNSCache.Load(qname)
+	DNSCacheMutex.RLock()
+	defer DNSCacheMutex.RUnlock()
+
+	records, ok := DNSCache[qname]
 	if ok {
-		return result.(*DNSRecords)
+		return records
 	}
 
 	return nil
 }
 
-func StoreDNSCache(qname string, record *DNSRecords) {
-	DNSCache.Store(qname, record)
+func StoreDNSCache(qname string, records *DNSRecords) {
+	DNSCacheMutex.Lock()
+	defer DNSCacheMutex.Unlock()
+
+	DNSCache[qname] = records
 }
 
-func NSLookup(name string, hint uint32, server string) (uint32, []net.IP) {
+func AddDNSLie(name string, pface *PhantomInterface) uint32 {
+	NoseLock.Lock()
+	Index := uint32(len(Nose))
+	Nose = append(Nose, DNSLie{name, pface})
+	NoseLock.Unlock()
+	return Index
+}
+
+func GetDNSLie(index int) (string, *PhantomInterface) {
+	NoseLock.Lock()
+	lie := Nose[index]
+	NoseLock.Unlock()
+	return lie.Name, lie.Interface
+}
+
+func (pface *PhantomInterface) NSLookup(name string) (uint32, []net.IP) {
+	hint := pface.Hint
 	var qtype uint16 = 1
 	if hint&HINT_IPV6 != 0 {
 		qtype = 28
@@ -1024,7 +1093,7 @@ func NSLookup(name string, hint uint32, server string) (uint32, []net.IP) {
 	var err error
 
 	var options ServerOptions
-	u, err := url.Parse(server)
+	u, err := url.Parse(pface.DNS)
 	if err != nil {
 		logPrintln(1, err)
 		return 0, nil
@@ -1051,11 +1120,8 @@ func NSLookup(name string, hint uint32, server string) (uint32, []net.IP) {
 			request = PackRequest(name, qtype, uint16(0), options.ECS)
 			response, err = TFOlookup(request, u.Host)
 		default:
-			NoseLock.Lock()
-			records.Index = uint32(len(Nose))
+			records.Index = AddDNSLie(name, pface)
 			records.ALPN = hint
-			Nose = append(Nose, name)
-			NoseLock.Unlock()
 			return records.Index, nil
 		}
 	}
@@ -1065,14 +1131,13 @@ func NSLookup(name string, hint uint32, server string) (uint32, []net.IP) {
 	}
 
 	if records.Index == 0 && hint != 0 {
-		NoseLock.Lock()
-		records.Index = uint32(len(Nose))
+		records.Index = AddDNSLie(name, pface)
 		records.ALPN = hint & HINT_DNS
-		Nose = append(Nose, name)
-		NoseLock.Unlock()
 	}
 
 	records.GetAnswers(response, options)
+	DNSRecordMutex.Lock()
+	defer DNSRecordMutex.Unlock()
 
 	switch qtype {
 	case 1:
@@ -1086,7 +1151,9 @@ func NSLookup(name string, hint uint32, server string) (uint32, []net.IP) {
 			records.IPv4Hint = &RecordAddresses{0, []net.IP{}}
 		}
 		logPrintln(3, "nslookup", name, qtype, records.IPv4Hint.Addresses)
-		return records.Index, records.IPv4Hint.Addresses
+		addresses := make([]net.IP, len(records.IPv4Hint.Addresses))
+		copy(addresses, records.IPv4Hint.Addresses)
+		return records.Index, addresses
 	case 28:
 		if records.IPv6Hint == nil && options.Fallback != nil {
 			if options.Fallback.To4() == nil {
@@ -1097,7 +1164,9 @@ func NSLookup(name string, hint uint32, server string) (uint32, []net.IP) {
 			records.IPv6Hint = &RecordAddresses{0, []net.IP{}}
 		}
 		logPrintln(3, "nslookup", name, qtype, records.IPv6Hint.Addresses)
-		return records.Index, records.IPv6Hint.Addresses
+		addresses := make([]net.IP, len(records.IPv6Hint.Addresses))
+		copy(addresses, records.IPv6Hint.Addresses)
+		return records.Index, addresses
 	}
 
 	return records.Index, nil
@@ -1112,6 +1181,7 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 		return 0, nil
 	}
 
+	var pface *PhantomInterface
 	var records *DNSRecords
 	if cache {
 		records = LoadDNSCache(name)
@@ -1119,19 +1189,11 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 			records = new(DNSRecords)
 			StoreDNSCache(name, records)
 
-			offset := 0
-			for i := 0; i < SubdomainDepth; i++ {
-				off := strings.Index(name[offset:], ".")
-				if off == -1 {
-					break
-				}
-				offset += off
-				top := LoadDNSCache(name[offset:])
-				if top != nil {
-					*records = *top
-					break
-				}
-				offset++
+			var offset int
+			pface, offset = DefaultProfile.GetInterface(name)
+			top := LoadDNSCache(name[offset:])
+			if top != nil {
+				*records = *top
 			}
 		}
 	} else {
@@ -1139,6 +1201,7 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 	}
 
 	CurrentTime := time.Now().Unix()
+	IsUnknownType := false
 
 	switch qtype {
 	case 1:
@@ -1147,6 +1210,8 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 				return records.Index, records.BuildResponse(request, qtype, 60)
 			}
 			records.IPv4Hint = nil
+		} else if records.Index > 0 {
+			return records.Index, records.BuildResponse(request, qtype, 60)
 		}
 	case 28:
 		if records.IPv6Hint != nil {
@@ -1154,45 +1219,48 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 				return records.Index, records.BuildResponse(request, qtype, 60)
 			}
 			records.IPv6Hint = nil
+		} else if records.Index > 0 {
+			return records.Index, records.BuildResponse(request, qtype, 60)
 		}
 	case 65:
-		if records.ALPN&(HINT_ALPN|HINT_HTTP|HINT_HTTPS|HINT_HTTP3) != 0 {
+		if records.ALPN&(HINT_ALPN|HINT_HTTPS|HINT_HTTP2|HINT_HTTP3) != 0 {
 			return records.Index, records.BuildResponse(request, qtype, 3600)
 		}
 	default:
-		return records.Index, records.BuildResponse(request, qtype, 3600)
+		IsUnknownType = true
 	}
 
-	var response []byte
-	var err error
+	if pface == nil {
+		pface, _ = DefaultProfile.GetInterface(name)
+	}
 
-	pface := DefaultProfile.GetInterface(name)
-	var options ServerOptions
-	DNS := ""
 	if pface != nil {
 		records.ALPN = pface.Hint & HINT_DNS
 		logPrintln(2, "request:", name, pface.DNS, pface.Protocol)
-		DNS = pface.DNS
 	} else {
 		logPrintln(4, "request:", name, "no answer")
 		return 0, records.BuildResponse(request, qtype, 3600)
 	}
 
-	if DNS == "" {
-		if records.Index == 0 && pface.Protocol != 0 {
-			NoseLock.Lock()
-			records.Index = uint32(len(Nose))
-			Nose = append(Nose, name)
-			NoseLock.Unlock()
+	UseVaddr := (pface.Hint&HINT_MODIFY) != 0 || pface.Protocol != 0
+	if UseVaddr {
+		if pface.DNS == "" {
+			if records.Index == 0 {
+				records.Index = AddDNSLie(name, pface)
+			}
+			return records.Index, records.BuildResponse(request, qtype, 3600)
+		} else if IsUnknownType {
+			return records.Index, records.BuildResponse(request, qtype, 3600)
 		}
-		return records.Index, records.BuildResponse(request, qtype, 3600)
 	}
 
-	u, err := url.Parse(DNS)
+	u, err := url.Parse(pface.DNS)
 	if err != nil {
 		logPrintln(1, err)
 		return 0, nil
 	}
+
+	var options ServerOptions
 
 	_request := request
 	_qtype := uint16(qtype)
@@ -1215,6 +1283,7 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 		}
 	}
 
+	var response []byte
 	switch u.Scheme {
 	case "udp":
 		response, err = UDPlookup(_request, u.Host)
@@ -1227,7 +1296,7 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 	case "tfo":
 		response, err = TFOlookup(_request, u.Host)
 	default:
-		logPrintln(1, "unknown protocol")
+		logPrintln(1, "unknown protocol", u.Scheme)
 		return 0, nil
 	}
 
@@ -1236,10 +1305,9 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 		return 0, nil
 	}
 
-	records.GetAnswers(response, options)
-
 	switch _qtype {
 	case 1:
+		records.GetAnswers(response, options)
 		if records.IPv4Hint == nil && options.Fallback != nil {
 			if options.Fallback.To4() != nil {
 				logPrintln(4, "request:", name, "fallback", options.Fallback)
@@ -1253,6 +1321,7 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 		}
 		logPrintln(3, "response:", name, qtype, records.IPv4Hint.Addresses)
 	case 28:
+		records.GetAnswers(response, options)
 		if records.IPv6Hint == nil && options.Fallback != nil {
 			if options.Fallback.To4() == nil {
 				logPrintln(4, "request:", name, "fallback", options.Fallback)
@@ -1265,33 +1334,58 @@ func NSRequest(request []byte, cache bool) (uint32, []byte) {
 			return 0, records.BuildResponse(request, qtype, 0)
 		}
 		logPrintln(3, "response:", name, qtype, records.IPv6Hint.Addresses)
+	default:
+		return 0, response
 	}
 
-	if records.Index == 0 && ((pface.Hint&HINT_MODIFY) != 0 || pface.Protocol != 0) {
-		NoseLock.Lock()
-		records.Index = uint32(len(Nose))
-		Nose = append(Nose, name)
-		NoseLock.Unlock()
+	if UseVaddr && (records.Index == 0) {
+		records.Index = AddDNSLie(name, pface)
+
+		if options.Output != "" {
+			f, err := os.OpenFile(options.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+			if err != nil {
+				logPrintln(1, options.Output, err)
+			}
+			defer f.Close()
+
+			if _qtype == 1 {
+				if records.IPv4Hint.Addresses != nil {
+					f.WriteString(name + "=")
+					for _, ip := range records.IPv4Hint.Addresses {
+						f.WriteString(ip.String())
+					}
+					f.WriteString("\n")
+				}
+			} else if _qtype == 28 {
+				if records.IPv6Hint.Addresses != nil {
+					f.WriteString(name + "=")
+					for _, ip := range records.IPv6Hint.Addresses {
+						f.WriteString(ip.String())
+					}
+					f.WriteString("\n")
+				}
+			}
+		}
 	}
 
 	return records.Index, records.BuildResponse(request, qtype, 0)
 }
 
-func (server *PhantomInterface) ResolveTCPAddr(host string, port int) (*net.TCPAddr, error) {
+func (pface *PhantomInterface) ResolveTCPAddr(host string, port int) (*net.TCPAddr, error) {
 	ip := net.ParseIP(host)
 	if ip != nil {
 		return &net.TCPAddr{IP: ip, Port: port}, nil
 	}
 
-	_, addrs := NSLookup(host, server.Hint, server.DNS)
+	_, addrs := pface.NSLookup(host)
 	if len(addrs) == 0 {
 		return nil, errors.New("no such host")
 	}
-	rand.Seed(time.Now().UnixNano())
+
 	return &net.TCPAddr{IP: addrs[rand.Intn(len(addrs))], Port: port}, nil
 }
 
-func (server *PhantomInterface) ResolveTCPAddrs(host string, port int) ([]*net.TCPAddr, error) {
+func (pface *PhantomInterface) ResolveTCPAddrs(host string, port int) ([]*net.TCPAddr, error) {
 	ip := net.ParseIP(host)
 	if ip != nil {
 		tcpAddrs := make([]*net.TCPAddr, 1)
@@ -1299,7 +1393,7 @@ func (server *PhantomInterface) ResolveTCPAddrs(host string, port int) ([]*net.T
 		return tcpAddrs, nil
 	}
 
-	_, addrs := NSLookup(host, server.Hint, server.DNS)
+	_, addrs := pface.NSLookup(host)
 	if len(addrs) == 0 {
 		return nil, errors.New("no such host")
 	}

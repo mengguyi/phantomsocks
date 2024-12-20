@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -83,12 +83,12 @@ func ListenAndServe(addr string, key string, serve func(net.Conn)) {
 	}
 }
 
-func PACServer(listenAddr string, proxyAddr string) {
+func PACServer(listenAddr string, profile string, proxyAddr string) {
 	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Panic(err)
 	}
-	pac := ptcp.GetPAC(proxyAddr)
+	pac := ptcp.GetPAC(proxyAddr, profile)
 	response := []byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length:%d\r\n\r\n%s", len(pac), pac))
 	fmt.Println("PACServer:", listenAddr)
 	for {
@@ -149,7 +149,7 @@ func StartService() {
 		return
 	}
 
-	bytes, err := ioutil.ReadAll(conf)
+	bytes, err := io.ReadAll(conf)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -188,6 +188,7 @@ func StartService() {
 			return
 		}
 	}
+
 	if ServiceConfig.HostsFile != "" {
 		err := ptcp.LoadHosts(ServiceConfig.HostsFile)
 		if err != nil {
@@ -206,7 +207,7 @@ func StartService() {
 		}
 	}
 
-	default_socks := ""
+	default_proxy := ""
 	for _, service := range ServiceConfig.Services {
 		switch service.Protocol {
 		case "dns":
@@ -225,11 +226,17 @@ func StartService() {
 					fmt.Println("DoH:", err)
 				}
 			}(service.Address, strings.Split(service.PrivateKey, ","))
+		case "http":
+			fmt.Println("HTTP:", service.Address)
+			go ListenAndServe(service.Address, service.PrivateKey, ptcp.HTTPProxy)
+			default_proxy = "HTTP " + service.Address
+		case "socks5":
+			fallthrough
 		case "socks":
 			fmt.Println("Socks:", service.Address)
 			go ListenAndServe(service.Address, service.PrivateKey, ptcp.SocksProxy)
 			go ptcp.SocksUDPProxy(service.Address)
-			default_socks = service.Address
+			default_proxy = strings.ToUpper(service.Protocol) + " " + service.Address
 		case "redirect":
 			fmt.Println("Redirect:", service.Address)
 			go ListenAndServe(service.Address, service.PrivateKey, ptcp.RedirectProxy)
@@ -262,8 +269,8 @@ func StartService() {
 		case "udp":
 			go ptcp.UDPMapping(service.Address, service.Peers[0].Endpoint)
 		case "pac":
-			if default_socks != "" {
-				go PACServer(service.Address, default_socks)
+			if default_proxy != "" {
+				go PACServer(service.Address, service.Profile, default_proxy)
 			}
 		case "reverse":
 			fmt.Println("Reverse:", service.Address)

@@ -14,9 +14,3 @@ require (
 	github.com/williamfhe/godivert v0.0.0-20181229124620-a48c5b872c73 // indirect
 	golang.org/x/net v0.7.0 // indirect
 )
-
-replace (
-	golang.zx2c4.com/wireguard => github.com/macronut/wireguard-go v0.0.0-20220521185917-e58dbe0aec0c
-	golang.zx2c4.com/wireguard/tun => github.com/macronut/wireguard-go/tun v0.0.0-20220521185917-e58dbe0aec0c
-	golang.zx2c4.com/wireguard/tun/netstack => github.com/macronut/wireguard-go/tun/netstack v0.0.0-20220521185917-e58dbe0aec0c
-)

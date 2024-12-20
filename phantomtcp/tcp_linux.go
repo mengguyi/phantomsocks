@@ -6,12 +6,12 @@ import (
 	"time"
 )
 
-func DialConnInfo(laddr, raddr *net.TCPAddr, server *PhantomInterface, payload []byte) (net.Conn, *ConnectionInfo, error) {
+func DialConnInfo(laddr, raddr *net.TCPAddr, pface *PhantomInterface, payload []byte) (net.Conn, *ConnectionInfo, error) {
 	var conn net.Conn
 	var err error
 
 	addr := raddr.String()
-	timeout := time.Millisecond * time.Duration(server.Timeout)
+	timeout := time.Millisecond * time.Duration(pface.Timeout)
 
 	tfo_id := 0
 	if payload != nil {
@@ -23,22 +23,22 @@ func DialConnInfo(laddr, raddr *net.TCPAddr, server *PhantomInterface, payload [
 		}()
 	}
 
-	AddConn(addr, server.Hint)
+	AddConn(addr, pface.Hint)
 
-	if (server.Hint & (HINT_MSS | HINT_TFO | HINT_HTFO | HINT_KEEPALIVE)) != 0 {
+	if (pface.Hint&(HINT_TFO|HINT_HTFO|HINT_KEEPALIVE)) != 0 || (pface.MTU) > 0 {
 		d := net.Dialer{Timeout: timeout, LocalAddr: laddr,
 			Control: func(network, address string, c syscall.RawConn) error {
 				err := c.Control(func(fd uintptr) {
-					if (server.Hint & HINT_MSS) != 0 {
+					if (pface.MTU) > 0 {
 						syscall.SetsockoptInt(int(fd),
-							syscall.SOL_TCP, syscall.TCP_MAXSEG, int(server.MTU))
+							syscall.SOL_TCP, syscall.TCP_MAXSEG, int(pface.MTU))
 					}
-					if (server.Hint & (HINT_TFO | HINT_HTFO)) != 0 {
+					if (pface.Hint & (HINT_TFO | HINT_HTFO)) != 0 {
 						//syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 30, 1)
 						syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, tfo_id<<2)
-						syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, int(server.TTL))
+						syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, int(pface.TTL))
 					}
-					if (server.Hint & HINT_KEEPALIVE) != 0 {
+					if (pface.Hint & HINT_KEEPALIVE) != 0 {
 						syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1)
 					}
 				})
@@ -71,7 +71,7 @@ func DialConnInfo(laddr, raddr *net.TCPAddr, server *PhantomInterface, payload [
 	}
 	DelConn(raddr.String())
 
-	if (payload != nil) || (server.MAXTTL != 0) {
+	if (payload != nil) || (pface.MaxTTL != 0) {
 		if connInfo == nil {
 			conn.Close()
 			return nil, nil, nil
@@ -87,8 +87,8 @@ func DialConnInfo(laddr, raddr *net.TCPAddr, server *PhantomInterface, payload [
 			conn.Close()
 			return nil, nil, err
 		}
-		if server.MAXTTL != 0 {
-			err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, int(server.MAXTTL))
+		if pface.MaxTTL != 0 {
+			err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, int(pface.MaxTTL))
 		} else {
 			err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, 64)
 		}

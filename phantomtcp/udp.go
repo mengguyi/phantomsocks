@@ -70,10 +70,12 @@ func relayUDP(left, right net.Conn) error {
 		}
 		left.Write(data[:n])
 	}
+
 	ch_err := <-ch
-	if err == nil {
+	if ch_err != nil {
 		err = ch_err
 	}
+
 	return err
 }
 

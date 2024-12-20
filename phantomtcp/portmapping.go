@@ -118,6 +118,26 @@ func DialUDP(address string) (net.Conn, error) {
 	}
 }
 
+func DialTCP(address string, device string) (net.Conn, error) {
+	if device == "" {
+		return net.Dial("tcp", address)
+	} else {
+		str_laddr, err := GetAddressFromInterface(device, IsIPv6(address))
+		if err != nil {
+			return nil, err
+		}
+		laddr, err := net.ResolveTCPAddr("tcp", str_laddr+":0")
+		if err != nil {
+			return nil, err
+		}
+		raddr, err := net.ResolveTCPAddr("tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		return net.DialTCP("tcp", laddr, raddr)
+	}
+}
+
 func UDPMapping(Address string, Target string) error {
 	if len(Target) == 0 {
 		return nil
@@ -127,7 +147,8 @@ func UDPMapping(Address string, Target string) error {
 
 	localPort, err := strconv.Atoi(Address)
 	if err == nil {
-		localConn, err := net.ListenUDP("udp", &net.UDPAddr{net.IP{127, 0, 0, 1}, localPort, ""})
+		serverAddr := net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: localPort, Zone: ""}
+		localConn, err := net.ListenUDP("udp", &serverAddr)
 		if err != nil {
 			return err
 		}
@@ -158,7 +179,7 @@ func UDPMapping(Address string, Target string) error {
 			n, SrcAddr, err = localConn.ReadFromUDP(data)
 			if err != nil {
 				SrcAddr = nil
-				log.Println(err)
+				logPrintln(1, err)
 				continue
 			}
 			conn.Write(data[:n])
@@ -178,7 +199,7 @@ func UDPMapping(Address string, Target string) error {
 		for {
 			n, clientAddr, err := localConn.ReadFromUDP(data)
 			if err != nil {
-				log.Println(err)
+				logPrintln(1, err)
 				continue
 			}
 
@@ -201,7 +222,7 @@ func UDPMapping(Address string, Target string) error {
 				_, err = remoteConn.Write(data[:n])
 				UDPLock.Unlock()
 				if err != nil {
-					log.Println(err)
+					logPrintln(1, err)
 					continue
 				}
 
@@ -224,8 +245,6 @@ func UDPMapping(Address string, Target string) error {
 			}
 		}
 	}
-
-	return nil
 }
 
 func TCPMapping(Listener net.Listener, Hosts string) error {
